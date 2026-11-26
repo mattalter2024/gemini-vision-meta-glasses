@@ -1,0 +1,22 @@
+# Android / Gradle build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+.gradle/
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local environment & API keys (never commit secrets!)
+local.properties
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
