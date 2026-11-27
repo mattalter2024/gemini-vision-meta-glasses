@@ -26,7 +26,8 @@ sealed interface LiveServerEvent {
  * 2. Gemini 3.8 Live API WebSocket (`BidiGenerateContent`) for real-time voice + video mode
  */
 object GeminiProtocol {
-    const val INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1/interactions"
+    const val INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    const val INTERACTIONS_API_REVISION = "2026-05-20"
     const val LIVE_WS_BASE_URL =
         "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
@@ -89,19 +90,33 @@ object GeminiProtocol {
             }
 
             val id = json.optString("id", "").ifBlank { null }
-            val steps = json.optJSONArray("steps")
-                ?: throw IllegalStateException("No steps returned by Gemini Interactions API.")
-
             val textParts = mutableListOf<String>()
-            for (i in 0 until steps.length()) {
-                val step = steps.optJSONObject(i) ?: continue
-                if (step.optString("type") != "model_output") continue
-                val content = step.optJSONArray("content") ?: continue
-                for (j in 0 until content.length()) {
-                    val block = content.optJSONObject(j) ?: continue
-                    if (block.optString("type") == "text") {
-                        val t = block.optString("text", "")
-                        if (t.isNotEmpty()) textParts += t
+
+            val steps = json.optJSONArray("steps")
+            if (steps != null) {
+                for (i in 0 until steps.length()) {
+                    val step = steps.optJSONObject(i) ?: continue
+                    if (step.optString("type") != "model_output") continue
+                    val content = step.optJSONArray("content") ?: continue
+                    for (j in 0 until content.length()) {
+                        val block = content.optJSONObject(j) ?: continue
+                        if (block.optString("type") == "text") {
+                            val t = block.optString("text", "")
+                            if (t.isNotEmpty()) textParts += t
+                        }
+                    }
+                }
+            }
+
+            if (textParts.isEmpty()) {
+                val outputs = json.optJSONArray("outputs")
+                if (outputs != null) {
+                    for (i in 0 until outputs.length()) {
+                        val block = outputs.optJSONObject(i) ?: continue
+                        if (block.optString("type") == "text") {
+                            val t = block.optString("text", "")
+                            if (t.isNotEmpty()) textParts += t
+                        }
                     }
                 }
             }

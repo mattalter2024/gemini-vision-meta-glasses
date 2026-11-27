@@ -41,6 +41,7 @@ class GeminiQaClient(
             .url(GeminiProtocol.INTERACTIONS_URL)
             .header("x-goog-api-key", apiKey.trim())
             .header("Content-Type", "application/json")
+            .header("Api-Revision", GeminiProtocol.INTERACTIONS_API_REVISION)
             .post(payload.toRequestBody(JSON_MEDIA_TYPE))
             .build()
 

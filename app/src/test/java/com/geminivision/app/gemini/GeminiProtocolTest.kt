@@ -59,6 +59,19 @@ class GeminiProtocolTest {
         assertEquals("int_abc123", okResult.getOrNull()?.interactionId)
         assertEquals("You are holding a ceramic coffee mug.", okResult.getOrNull()?.text)
 
+        val outputsFallback = """
+            {
+              "id": "int_legacy",
+              "outputs": [
+                { "type": "text", "text": "Fallback output text." }
+              ]
+            }
+        """.trimIndent()
+        val fallbackResult = GeminiProtocol.parseInteractionResponse(outputsFallback)
+        assertTrue(fallbackResult.isSuccess)
+        assertEquals("Fallback output text.", fallbackResult.getOrNull()?.text)
+        assertTrue(GeminiProtocol.INTERACTIONS_URL.contains("/v1beta/interactions"))
+
         val errPayload = """{"error":{"code":401,"message":"API key not valid."}}"""
         val errResult = GeminiProtocol.parseInteractionResponse(errPayload)
         assertTrue(errResult.isFailure)
