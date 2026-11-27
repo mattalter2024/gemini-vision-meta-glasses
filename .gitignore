@@ -1,5 +1,6 @@
 # Android / Gradle build outputs
 *.apk
+!dist/*.apk
 *.aab
 *.ap_
 *.dex

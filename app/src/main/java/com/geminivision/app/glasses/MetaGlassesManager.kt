@@ -13,9 +13,16 @@ import com.meta.wearable.dat.camera.types.StreamState
 import com.meta.wearable.dat.camera.types.VideoQuality
 import com.meta.wearable.dat.core.Wearables
 import com.meta.wearable.dat.core.selectors.AutoDeviceSelector
+import com.meta.wearable.dat.core.selectors.SpecificDeviceSelector
 import com.meta.wearable.dat.core.session.DeviceSession
 import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.core.types.Device
+import com.meta.wearable.dat.core.types.DeviceCompatibility
+import com.meta.wearable.dat.core.types.DeviceIdentifier
+import com.meta.wearable.dat.core.types.DeviceSessionError
+import com.meta.wearable.dat.core.types.DeviceType
+import com.meta.wearable.dat.core.types.DonState
+import com.meta.wearable.dat.core.types.HingeState
 import com.meta.wearable.dat.core.types.LinkState
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
@@ -38,10 +45,18 @@ data class GlassesUiStatus(
     val registrationState: RegistrationState = RegistrationState.UNAVAILABLE,
     val sessionState: DeviceSessionState = DeviceSessionState.IDLE,
     val streamState: StreamState = StreamState.STOPPED,
+    val discoveredDeviceCount: Int = 0,
     val deviceName: String? = null,
+    val deviceType: DeviceType? = null,
     val batteryLevel: Int? = null,
     val linkState: LinkState? = null,
+    val compatibility: DeviceCompatibility? = null,
+    val hingeState: HingeState? = null,
+    val donState: DonState? = null,
     val cameraPermissionGranted: Boolean = false,
+    val isWaitingForEligibleDevice: Boolean = false,
+    val requiresFirmwareUpdate: Boolean = false,
+    val requiresGlassesAppUpdate: Boolean = false,
     val lastError: String? = null
 ) {
     val isRegistered: Boolean
@@ -50,19 +65,39 @@ data class GlassesUiStatus(
     val isStreaming: Boolean
         get() = streamState == StreamState.STREAMING || streamState == StreamState.STARTED
 
+    val isEligibleDeviceReady: Boolean
+        get() = discoveredDeviceCount > 0 &&
+            linkState == LinkState.CONNECTED &&
+            compatibility == DeviceCompatibility.COMPATIBLE
+
+    val diagnosticsLine: String
+        get() = buildString {
+            append("Reg: ${registrationState.name}")
+            append(" • Devices: $discoveredDeviceCount")
+            linkState?.let { append(" • Link: ${it.name}") }
+            compatibility?.let { append(" • Compat: ${it.name}") }
+            hingeState?.takeIf { it != HingeState.UNKNOWN }?.let { append(" • Hinges: ${it.name}") }
+        }
+
     val statusBadgeText: String
         get() = when {
             isStreaming -> buildString {
                 append(deviceName ?: "Meta Glasses")
                 batteryLevel?.takeIf { it in 0..100 }?.let { append(" • $it%") }
             }
+            isWaitingForEligibleDevice -> "Waiting for glasses link..."
             sessionState == DeviceSessionState.STARTING || streamState == StreamState.STARTING ->
                 "Connecting glasses camera..."
-            isRegistered && !deviceName.isNullOrBlank() -> buildString {
-                append(deviceName)
+            isEligibleDeviceReady -> buildString {
+                append(deviceName ?: "Meta Glasses")
                 batteryLevel?.takeIf { it in 0..100 }?.let { append(" • $it%") }
+                append(" (Ready)")
             }
-            isRegistered -> "Meta Glasses linked"
+            isRegistered && discoveredDeviceCount > 0 -> buildString {
+                append(deviceName ?: "Meta Glasses")
+                linkState?.let { append(" • ${it.name.lowercase().replaceFirstChar(Char::uppercase)}") }
+            }
+            isRegistered -> "Meta Glasses linked (0 active)"
             registrationState == RegistrationState.REGISTERING -> "Registering with Meta AI..."
             registrationState == RegistrationState.AVAILABLE -> "Glasses ready to connect"
             else -> "Open Meta AI app to link glasses"
@@ -74,6 +109,7 @@ data class GlassesUiStatus(
  * display-less Meta smart glasses (Ray-Ban Meta / Oakley Meta):
  * - Registration with Meta AI companion app
  * - Glasses camera permission checks
+ * - Live eligibility monitoring (auto-waits until linkState == CONNECTED & compatibility == COMPATIBLE)
  * - DeviceSession & Camera Stream lifecycle (POV video frames -> JPEG + Bitmap)
  * - Still photo capture for high-detail Vision QA
  */
@@ -88,6 +124,7 @@ class MetaGlassesManager {
 
     private val latestJpegRef = AtomicReference<ByteArray?>(null)
     private val latestBitmapRef = AtomicReference<Bitmap?>(null)
+    private val activeEligibleDeviceIdRef = AtomicReference<DeviceIdentifier?>(null)
 
     @Volatile
     private var deviceSession: DeviceSession? = null
@@ -125,21 +162,33 @@ class MetaGlassesManager {
             runCatching {
                 Wearables.devices.collectLatest { deviceIds ->
                     deviceMetaJob?.cancel()
-                    val firstId = deviceIds.firstOrNull()
-                    if (firstId == null) {
-                        _status.update { it.copy(deviceName = null, batteryLevel = null, linkState = null) }
-                    } else {
-                        val metaFlow = Wearables.devicesMetadata[firstId]
-                        if (metaFlow != null) {
-                            deviceMetaJob = scope.launch {
-                                metaFlow.collectLatest { device: Device ->
-                                    _status.update {
-                                        it.copy(
-                                            deviceName = device.name.ifBlank { "Meta Glasses" },
-                                            batteryLevel = device.batteryLevel,
-                                            linkState = device.linkState
-                                        )
-                                    }
+                    _status.update { it.copy(discoveredDeviceCount = deviceIds.size) }
+
+                    if (deviceIds.isEmpty()) {
+                        activeEligibleDeviceIdRef.set(null)
+                        _status.update {
+                            it.copy(
+                                deviceName = null,
+                                deviceType = null,
+                                batteryLevel = null,
+                                linkState = null,
+                                compatibility = null,
+                                hingeState = null,
+                                donState = null,
+                                requiresFirmwareUpdate = false
+                            )
+                        }
+                        return@collectLatest
+                    }
+
+                    // Observe metadata for all discovered devices and prefer the first CONNECTED + COMPATIBLE one
+                    deviceMetaJob = scope.launch {
+                        val metadataMap = Wearables.devicesMetadata
+                        for (deviceId in deviceIds) {
+                            val metaFlow = metadataMap[deviceId] ?: continue
+                            launch {
+                                metaFlow.collectLatest { device ->
+                                    onDeviceMetadataUpdated(deviceId, device)
                                 }
                             }
                         }
@@ -153,9 +202,51 @@ class MetaGlassesManager {
         scope.launch {
             runCatching {
                 Wearables.registrationErrorStream.collect { error ->
-                    _status.update { it.copy(lastError = "Meta registration error: $error") }
+                    _status.update { it.copy(lastError = "Meta registration error: ${error.description}") }
                 }
             }
+        }
+    }
+
+    private fun onDeviceMetadataUpdated(deviceId: DeviceIdentifier, device: Device) {
+        val isEligible = device.linkState == LinkState.CONNECTED &&
+            device.compatibility == DeviceCompatibility.COMPATIBLE
+
+        if (isEligible) {
+            activeEligibleDeviceIdRef.set(deviceId)
+        } else if (activeEligibleDeviceIdRef.get() == deviceId) {
+            activeEligibleDeviceIdRef.set(null)
+        }
+
+        val currentEligible = activeEligibleDeviceIdRef.get()
+        // If another device is already eligible, don't overwrite the primary UI status with a disconnected one
+        if (currentEligible != null && currentEligible != deviceId) return
+
+        val needsFirmware = device.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED
+        val autoError = when {
+            needsFirmware -> "Your Meta glasses firmware needs an update before DAT camera streaming works."
+            device.compatibility == DeviceCompatibility.SDK_UPDATE_REQUIRED ->
+                "This app's Meta Wearables SDK version is older than required by your glasses."
+            else -> null
+        }
+
+        _status.update { prev ->
+            prev.copy(
+                deviceName = device.name.ifBlank { "Meta Glasses" },
+                deviceType = device.deviceType,
+                batteryLevel = device.batteryLevel,
+                linkState = device.linkState,
+                compatibility = device.compatibility,
+                hingeState = device.hingeState,
+                donState = device.donState,
+                requiresFirmwareUpdate = needsFirmware,
+                lastError = autoError ?: if (isEligible) null else prev.lastError
+            )
+        }
+
+        // If user already tapped Start (or just granted permission) and was waiting for glasses to connect, start automatically!
+        if (isEligible && _status.value.isWaitingForEligibleDevice && deviceSession == null) {
+            createAndStartSession(deviceId)
         }
     }
 
@@ -174,6 +265,22 @@ class MetaGlassesManager {
             Wearables.startUnregistration(activity)
         }.onFailure { err ->
             _status.update { it.copy(lastError = err.message ?: "Unable to unregister glasses.") }
+        }
+    }
+
+    fun openFirmwareUpdate(activity: Activity) {
+        runCatching {
+            Wearables.openFirmwareUpdate(activity).onFailure { err, _ ->
+                _status.update { it.copy(lastError = "Unable to open firmware update: ${err.description}") }
+            }
+        }
+    }
+
+    fun openGlassesAppUpdate(activity: Activity) {
+        runCatching {
+            Wearables.openDATGlassesAppUpdate(activity).onFailure { err, _ ->
+                _status.update { it.copy(lastError = "Unable to open glasses update: ${err.description}") }
+            }
         }
     }
 
@@ -197,13 +304,99 @@ class MetaGlassesManager {
         }
     }
 
+    fun onAppResumed() {
+        scope.launch {
+            if (_status.value.isRegistered) {
+                refreshCameraPermission()
+                val eligibleId = findBestEligibleDeviceId()
+                if (eligibleId != null && _status.value.isWaitingForEligibleDevice && deviceSession == null) {
+                    createAndStartSession(eligibleId)
+                }
+            }
+        }
+    }
+
     fun startCameraStream() {
         if (deviceSession != null && _status.value.isStreaming) return
         stopCameraStream()
-        _status.update { it.copy(lastError = null) }
+
+        val snapshot = _status.value
+        if (!snapshot.isRegistered) {
+            _status.update {
+                it.copy(lastError = "Connect your glasses in the Meta AI app first (Registration: ${snapshot.registrationState}).")
+            }
+            return
+        }
+
+        val eligibleId = findBestEligibleDeviceId()
+        if (eligibleId == null) {
+            val helpfulReason = buildNoEligibleDeviceReason(_status.value)
+            _status.update {
+                it.copy(
+                    isWaitingForEligibleDevice = true,
+                    lastError = helpfulReason
+                )
+            }
+            return
+        }
+
+        createAndStartSession(eligibleId)
+    }
+
+    private fun findBestEligibleDeviceId(): DeviceIdentifier? {
+        activeEligibleDeviceIdRef.get()?.let { cached ->
+            val dev = Wearables.devicesMetadata[cached]?.value
+            if (dev?.linkState == LinkState.CONNECTED && dev.compatibility == DeviceCompatibility.COMPATIBLE) {
+                return cached
+            }
+        }
+        val ids = Wearables.devices.value
+        for (id in ids) {
+            val dev = Wearables.devicesMetadata[id]?.value ?: continue
+            if (dev.linkState == LinkState.CONNECTED && dev.compatibility == DeviceCompatibility.COMPATIBLE) {
+                activeEligibleDeviceIdRef.set(id)
+                return id
+            }
+        }
+        return null
+    }
+
+    private fun buildNoEligibleDeviceReason(s: GlassesUiStatus): String {
+        return when {
+            s.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED ->
+                "Glasses firmware update required. Tap 'Update Firmware' to update in the Meta AI app."
+            s.compatibility == DeviceCompatibility.SDK_UPDATE_REQUIRED ->
+                "SDK update required for your glasses firmware."
+            s.hingeState == HingeState.CLOSED ->
+                "Glasses hinges are closed. Unfold and wear your Meta glasses, then wait a moment — streaming will start automatically."
+            s.discoveredDeviceCount == 0 ->
+                "No eligible Meta glasses found yet. Check that: (1) Developer Mode is ON in Meta AI (Settings → App Info → tap version 5×), (2) your glasses are unfolded & connected in Meta AI, and (3) Bluetooth permission is allowed. Waiting automatically..."
+            s.linkState == LinkState.CONNECTING ->
+                "Meta glasses are connecting... Camera stream will start automatically once connected."
+            s.linkState == LinkState.DISCONNECTED ->
+                "Meta glasses (${s.deviceName ?: "paired"}) are currently DISCONNECTED from the DAT bridge. Open the Meta AI app, wake/unfold your glasses, and return here — streaming will auto-start."
+            else ->
+                "Waiting for Meta glasses to become eligible (${s.diagnosticsLine}). Make sure glasses are unfolded, awake, and updated in Meta AI."
+        }
+    }
+
+    private fun createAndStartSession(deviceId: DeviceIdentifier?) {
+        _status.update {
+            it.copy(
+                isWaitingForEligibleDevice = false,
+                requiresGlassesAppUpdate = false,
+                lastError = null
+            )
+        }
+
+        val selector = if (deviceId != null) {
+            SpecificDeviceSelector(deviceId)
+        } else {
+            AutoDeviceSelector()
+        }
 
         val sessionResult = runCatching {
-            Wearables.createSession(AutoDeviceSelector())
+            Wearables.createSession(selector)
         }.getOrElse { err ->
             _status.update { it.copy(lastError = "Could not create glasses session: ${err.message}") }
             return
@@ -216,8 +409,20 @@ class MetaGlassesManager {
                 session.start()
             },
             onFailure = { error, throwable ->
+                val waiting = error == DeviceSessionError.NO_ELIGIBLE_DEVICE
+                val needsDatAppUpdate = error == DeviceSessionError.DAT_APP_ON_THE_GLASSES_UPDATE_REQUIRED
+                val friendly = when (error) {
+                    DeviceSessionError.NO_ELIGIBLE_DEVICE -> buildNoEligibleDeviceReason(_status.value)
+                    DeviceSessionError.DAT_APP_ON_THE_GLASSES_UPDATE_REQUIRED ->
+                        "Meta glasses require a DAT app update. Tap 'Update Glasses App' below."
+                    else -> "Glasses session failed: ${throwable?.message ?: error.description}"
+                }
                 _status.update {
-                    it.copy(lastError = "Glasses session failed: ${throwable?.message ?: error}")
+                    it.copy(
+                        isWaitingForEligibleDevice = waiting,
+                        requiresGlassesAppUpdate = needsDatAppUpdate,
+                        lastError = friendly
+                    )
                 }
             }
         )
@@ -228,7 +433,13 @@ class MetaGlassesManager {
         sessionWatcherJob = scope.launch {
             launch {
                 session.errors.collect { err ->
-                    _status.update { it.copy(lastError = "Glasses session error: $err") }
+                    val needsDatAppUpdate = err == DeviceSessionError.DAT_APP_ON_THE_GLASSES_UPDATE_REQUIRED
+                    _status.update {
+                        it.copy(
+                            requiresGlassesAppUpdate = needsDatAppUpdate,
+                            lastError = "Glasses session error: ${err.description}"
+                        )
+                    }
                 }
             }
             launch {
@@ -236,8 +447,12 @@ class MetaGlassesManager {
                     _status.update {
                         it.copy(
                             deviceName = device.name.ifBlank { it.deviceName ?: "Meta Glasses" },
+                            deviceType = device.deviceType,
                             batteryLevel = device.batteryLevel,
-                            linkState = device.linkState
+                            linkState = device.linkState,
+                            compatibility = device.compatibility,
+                            hingeState = device.hingeState,
+                            donState = device.donState
                         )
                     }
                 }
@@ -281,7 +496,6 @@ class MetaGlassesManager {
                 videoCollectJob = scope.launch(Dispatchers.Default) {
                     stream.videoStream.collect { frame ->
                         if (frame.isCodecConfig || frame.isCompressed) return@collect
-                        // Throttle UI/JPEG decoding to ~6 FPS to stay cool & responsive on glasses + phone
                         val now = System.currentTimeMillis()
                         if (now - lastFrameProcessMs < 150L) return@collect
                         lastFrameProcessMs = now
@@ -308,7 +522,7 @@ class MetaGlassesManager {
             },
             onFailure = { error, throwable ->
                 _status.update {
-                    it.copy(lastError = "Unable to attach glasses camera: ${throwable?.message ?: error}")
+                    it.copy(lastError = "Unable to attach glasses camera: ${throwable?.message ?: error.description}")
                 }
             }
         )
@@ -318,10 +532,6 @@ class MetaGlassesManager {
 
     fun getLatestBitmap(): Bitmap? = latestBitmapRef.get()
 
-    /**
-     * Captures a sharp still photo from the Meta glasses if a stream is active,
-     * falling back seamlessly to the latest decoded video frame.
-     */
     suspend fun capturePhotoOrLatestFrame(): Pair<ByteArray, Bitmap?>? = withContext(Dispatchers.IO) {
         val activeStream = camera?.stream
         if (activeStream != null && _status.value.isStreaming) {
@@ -373,7 +583,8 @@ class MetaGlassesManager {
         _status.update {
             it.copy(
                 sessionState = DeviceSessionState.STOPPED,
-                streamState = StreamState.STOPPED
+                streamState = StreamState.STOPPED,
+                isWaitingForEligibleDevice = false
             )
         }
     }

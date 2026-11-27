@@ -187,6 +187,18 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
         glassesManager.startUnregistration(activity)
     }
 
+    fun openGlassesFirmwareUpdate(activity: Activity) {
+        glassesManager.openFirmwareUpdate(activity)
+    }
+
+    fun openGlassesAppUpdate(activity: Activity) {
+        glassesManager.openGlassesAppUpdate(activity)
+    }
+
+    fun onAppResumed() {
+        glassesManager.onAppResumed()
+    }
+
     fun startGlassesStream() {
         glassesManager.startCameraStream()
     }

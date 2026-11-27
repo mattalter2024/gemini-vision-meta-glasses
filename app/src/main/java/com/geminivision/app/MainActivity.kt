@@ -74,6 +74,8 @@ class MainActivity : ComponentActivity() {
                     },
                     onStartGlassesStream = viewModel::startGlassesStream,
                     onStopGlassesStream = viewModel::stopGlassesStream,
+                    onOpenFirmwareUpdate = { viewModel.openGlassesFirmwareUpdate(this) },
+                    onOpenGlassesAppUpdate = { viewModel.openGlassesAppUpdate(this) },
                     onSwitchToPhoneFallback = {
                         viewModel.saveSettings(
                             state.settings.copy(videoSource = VideoSourceMode.PHONE_CAMERA)
@@ -116,6 +118,12 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updatePhoneCameraPermissionFlag()
+        viewModel.onAppResumed()
     }
 
     override fun onNewIntent(intent: Intent) {

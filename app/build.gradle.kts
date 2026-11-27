@@ -24,8 +24,8 @@ android {
         applicationId = "com.geminivision.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "GEMINI_API_KEY", "\"${geminiApiKey.replace("\"", "\\\"")}\"")
@@ -33,6 +33,11 @@ android {
         // Meta Wearables Device Access Toolkit (use "0" for Developer Mode testing)
         manifestPlaceholders["mwdat_application_id"] = mwdatAppId
         manifestPlaceholders["mwdat_client_token"] = mwdatClientToken
+
+        // Keep physical Android phone ABIs only (reduces APK size ~50% & stays well under GitHub's 100 MB limit)
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
@@ -64,6 +69,16 @@ kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
+}
+
+val exportDebugApk by tasks.registering(Copy::class) {
+    from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
+    into(rootProject.layout.projectDirectory.dir("dist"))
+    rename { "gemini-vision-debug.apk" }
+}
+
+tasks.matching { it.name == "assembleDebug" }.configureEach {
+    finalizedBy(exportDebugApk)
 }
 
 dependencies {

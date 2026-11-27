@@ -104,6 +104,8 @@ fun GeminiVisionScreen(
     onRequestGlassesCameraPermission: () -> Unit,
     onStartGlassesStream: () -> Unit,
     onStopGlassesStream: () -> Unit,
+    onOpenFirmwareUpdate: () -> Unit = {},
+    onOpenGlassesAppUpdate: () -> Unit = {},
     onSwitchToPhoneFallback: () -> Unit,
     onRequestPhoneCameraPermission: () -> Unit,
     onTogglePhoneCameraFacing: () -> Unit,
@@ -133,6 +135,8 @@ fun GeminiVisionScreen(
             onConnectMetaGlasses = onConnectMetaGlasses,
             onRequestGlassesCameraPermission = onRequestGlassesCameraPermission,
             onStartGlassesStream = onStartGlassesStream,
+            onOpenFirmwareUpdate = onOpenFirmwareUpdate,
+            onOpenGlassesAppUpdate = onOpenGlassesAppUpdate,
             onSwitchToPhoneFallback = onSwitchToPhoneFallback,
             onRequestPhoneCameraPermission = onRequestPhoneCameraPermission,
             onPhoneFrame = onPhoneFrame
@@ -227,6 +231,8 @@ private fun ViewfinderLayer(
     onConnectMetaGlasses: () -> Unit,
     onRequestGlassesCameraPermission: () -> Unit,
     onStartGlassesStream: () -> Unit,
+    onOpenFirmwareUpdate: () -> Unit,
+    onOpenGlassesAppUpdate: () -> Unit,
     onSwitchToPhoneFallback: () -> Unit,
     onRequestPhoneCameraPermission: () -> Unit,
     onPhoneFrame: (ByteArray, Bitmap) -> Unit
@@ -247,6 +253,8 @@ private fun ViewfinderLayer(
                     onConnectMetaGlasses = onConnectMetaGlasses,
                     onRequestGlassesCameraPermission = onRequestGlassesCameraPermission,
                     onStartGlassesStream = onStartGlassesStream,
+                    onOpenFirmwareUpdate = onOpenFirmwareUpdate,
+                    onOpenGlassesAppUpdate = onOpenGlassesAppUpdate,
                     onSwitchToPhoneFallback = onSwitchToPhoneFallback
                 )
             }
@@ -294,6 +302,8 @@ private fun MetaGlassesSetupCanvas(
     onConnectMetaGlasses: () -> Unit,
     onRequestGlassesCameraPermission: () -> Unit,
     onStartGlassesStream: () -> Unit,
+    onOpenFirmwareUpdate: () -> Unit,
+    onOpenGlassesAppUpdate: () -> Unit,
     onSwitchToPhoneFallback: () -> Unit
 ) {
     Box(
@@ -316,24 +326,41 @@ private fun MetaGlassesSetupCanvas(
             Column(
                 modifier = Modifier.padding(22.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Icon(
                     imageVector = Icons.Default.BluetoothAudio,
                     contentDescription = null,
-                    tint = GeminiCyan,
-                    modifier = Modifier.size(40.dp)
+                    tint = if (status.isEligibleDeviceReady) LiveEmerald else GeminiCyan,
+                    modifier = Modifier.size(38.dp)
                 )
                 Text(
                     text = "Meta Glasses Companion",
                     style = MaterialTheme.typography.titleLarge
                 )
+
+                // Live DAT diagnostic pill so connection issues are immediately transparent
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = Color(0xFF182235),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = status.diagnosticsLine,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFF93C5FD),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+
                 Text(
                     text = when {
                         !status.isRegistered ->
                             "Link your Ray-Ban Meta or Oakley Meta glasses via the Meta AI app (with Developer Mode enabled) to stream POV camera frames and hear Gemini in your glasses."
                         !status.cameraPermissionGranted ->
                             "Glasses are linked! Grant camera access in Meta AI so Gemini can see through your glasses."
+                        status.isWaitingForEligibleDevice ->
+                            "Waiting for an eligible connected Meta glasses link. Make sure your glasses are unfolded, awake, and connected in the Meta AI app."
                         else ->
                             "Your Meta glasses are ready. Start the POV camera stream to let Gemini see what you see."
                     },
@@ -349,31 +376,57 @@ private fun MetaGlassesSetupCanvas(
                     )
                 }
 
-                when {
-                    !status.isRegistered -> {
-                        Button(
-                            onClick = onConnectMetaGlasses,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Connect Meta Glasses")
-                        }
+                if (status.requiresFirmwareUpdate) {
+                    Button(
+                        onClick = onOpenFirmwareUpdate,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Update Glasses Firmware in Meta AI")
                     }
-                    !status.cameraPermissionGranted -> {
-                        Button(
-                            onClick = onRequestGlassesCameraPermission,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Allow Glasses Camera")
-                        }
+                } else if (status.requiresGlassesAppUpdate) {
+                    Button(
+                        onClick = onOpenGlassesAppUpdate,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Update Glasses App in Meta AI")
                     }
-                    else -> {
-                        Button(
-                            onClick = onStartGlassesStream,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null)
-                            Spacer(Modifier.width(6.dp))
-                            Text("Start Glasses Camera")
+                } else {
+                    when {
+                        !status.isRegistered -> {
+                            Button(
+                                onClick = onConnectMetaGlasses,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Connect Meta Glasses")
+                            }
+                        }
+                        !status.cameraPermissionGranted -> {
+                            Button(
+                                onClick = onRequestGlassesCameraPermission,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Allow Glasses Camera")
+                            }
+                        }
+                        else -> {
+                            Button(
+                                onClick = onStartGlassesStream,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                if (status.isWaitingForEligibleDevice) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                        color = MaterialTheme.colorScheme.onPrimary
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Retry Glasses Camera")
+                                } else {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Start Glasses Camera")
+                                }
+                            }
                         }
                     }
                 }
