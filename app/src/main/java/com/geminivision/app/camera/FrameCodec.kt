@@ -11,24 +11,24 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
 /**
- * Converts video frames from both Meta Wearables DAT (I420 / NV21 ByteBuffers)
- * and Android CameraX (YUV_420_888 ImageProxy) into compact rotated JPEGs + Bitmaps
- * suitable for Gemini Vision QA and 1 FPS Gemini Live streaming.
+ * High-speed video frame utilities:
+ * - Fast direct I420 -> ARGB_8888 Bitmap conversion (no JPEG round-trip!) for smooth ~24 FPS Meta glasses preview.
+ * - On-demand JPEG encoding only when sending a frame to Gemini (1 FPS Live or single QA capture).
  */
 object FrameCodec {
 
     /**
-     * Converts an I420 planar ByteBuffer (standard output of Meta DAT VideoFrame)
-     * into a downscaled JPEG + Bitmap.
+     * Converts a raw I420 ByteBuffer from Meta DAT directly into an ARGB_8888 Bitmap
+     * without any JPEG compression/decompression overhead.
+     * Uses 2x subsampling automatically when width or height > maxEdge for ultra-fast preview rendering.
      */
-    fun i420BufferToJpegAndBitmap(
+    fun i420BufferToBitmapFast(
         buffer: ByteBuffer,
         width: Int,
         height: Int,
-        maxEdge: Int = 768,
-        jpegQuality: Int = 75
-    ): Pair<ByteArray, Bitmap>? {
-        if (width <= 0 || height <= 0) return null
+        maxEdge: Int = 720
+    ): Bitmap? {
+        if (width <= 1 || height <= 1) return null
         val dup = buffer.duplicate()
         dup.rewind()
         val ySize = width * height
@@ -37,27 +37,77 @@ object FrameCodec {
 
         val i420 = ByteArray(expectedSize)
         dup.get(i420)
-        val nv21 = i420ToNv21(i420, width, height)
-        return nv21ToJpegAndBitmap(nv21, width, height, rotationDegrees = 0, maxEdge = maxEdge, jpegQuality = jpegQuality)
+
+        val step = if (maxOf(width, height) > maxEdge) 2 else 1
+        val outW = (width + step - 1) / step
+        val outH = (height + step - 1) / step
+        val pixels = i420ToArgbPixels(i420, width, height, step)
+
+        return Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
     }
 
     /**
-     * Converts a CameraX ImageProxy (YUV_420_888) into a properly rotated, downscaled JPEG + Bitmap.
+     * Pure Kotlin fast integer BT.601 YUV I420 -> ARGB_8888 conversion (JVM unit-testable).
      */
-    fun imageProxyToJpegAndBitmap(
-        image: ImageProxy,
+    fun i420ToArgbPixels(
+        i420: ByteArray,
+        width: Int,
+        height: Int,
+        step: Int = 1
+    ): IntArray {
+        val outW = (width + step - 1) / step
+        val outH = (height + step - 1) / step
+        val pixels = IntArray(outW * outH)
+
+        val ySize = width * height
+        val chromaW = width / 2
+        val uPlaneOffset = ySize
+        val vPlaneOffset = ySize + (ySize / 4)
+
+        var outIdx = 0
+        var y = 0
+        while (y < height) {
+            val yRow = y * width
+            val uvRow = (y shr 1) * chromaW
+            var x = 0
+            while (x < width) {
+                val yVal = (i420[yRow + x].toInt() and 0xFF) - 16
+                val uvIdx = uvRow + (x shr 1)
+                val uVal = (i420[uPlaneOffset + uvIdx].toInt() and 0xFF) - 128
+                val vVal = (i420[vPlaneOffset + uvIdx].toInt() and 0xFF) - 128
+
+                val y1192 = 1192 * (if (yVal < 0) 0 else yVal)
+                var r = (y1192 + 1634 * vVal) shr 10
+                var g = (y1192 - 833 * vVal - 400 * uVal) shr 10
+                var b = (y1192 + 2066 * uVal) shr 10
+
+                if (r < 0) r = 0 else if (r > 255) r = 255
+                if (g < 0) g = 0 else if (g > 255) g = 255
+                if (b < 0) b = 0 else if (b > 255) b = 255
+
+                pixels[outIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                x += step
+            }
+            y += step
+        }
+        return pixels
+    }
+
+    /**
+     * Compresses a Bitmap to JPEG on demand (called only when sending a frame to Gemini QA or 1 FPS Live).
+     */
+    fun bitmapToJpeg(
+        source: Bitmap,
         maxEdge: Int = 768,
-        jpegQuality: Int = 75
-    ): Pair<ByteArray, Bitmap>? {
-        val nv21 = imageProxyToNv21(image) ?: return null
-        return nv21ToJpegAndBitmap(
-            nv21 = nv21,
-            width = image.width,
-            height = image.height,
-            rotationDegrees = image.imageInfo.rotationDegrees,
-            maxEdge = maxEdge,
-            jpegQuality = jpegQuality
-        )
+        jpegQuality: Int = 78
+    ): ByteArray {
+        val scaled = scaleBitmapIfNeeded(source, maxEdge)
+        val out = ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out)
+        if (scaled != source) {
+            scaled.recycle()
+        }
+        return out.toByteArray()
     }
 
     fun downscaleBitmapToJpeg(
@@ -71,36 +121,23 @@ object FrameCodec {
         return out.toByteArray() to scaled
     }
 
-    fun i420ToNv21(i420: ByteArray, width: Int, height: Int): ByteArray {
-        val ySize = width * height
-        val chromaSize = ySize / 4
-        val nv21 = ByteArray(ySize + chromaSize * 2)
-        System.arraycopy(i420, 0, nv21, 0, ySize)
-
-        val uOffset = ySize
-        val vOffset = ySize + chromaSize
-        var dst = ySize
-        for (i in 0 until chromaSize) {
-            nv21[dst++] = i420[vOffset + i] // V
-            nv21[dst++] = i420[uOffset + i] // U
-        }
-        return nv21
-    }
-
-    private fun nv21ToJpegAndBitmap(
-        nv21: ByteArray,
-        width: Int,
-        height: Int,
-        rotationDegrees: Int,
-        maxEdge: Int,
-        jpegQuality: Int
+    /**
+     * Converts a CameraX ImageProxy (YUV_420_888) into a properly rotated, downscaled JPEG + Bitmap
+     * for optional Phone Camera fallback mode.
+     */
+    fun imageProxyToJpegAndBitmap(
+        image: ImageProxy,
+        maxEdge: Int = 768,
+        jpegQuality: Int = 75
     ): Pair<ByteArray, Bitmap>? {
+        val nv21 = imageProxyToNv21(image) ?: return null
         val rawOut = ByteArrayOutputStream()
-        val yuv = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        if (!yuv.compressToJpeg(Rect(0, 0, width, height), 85, rawOut)) return null
+        val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        if (!yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 82, rawOut)) return null
         val rawJpeg = rawOut.toByteArray()
 
         var bitmap = BitmapFactory.decodeByteArray(rawJpeg, 0, rawJpeg.size) ?: return null
+        val rotationDegrees = image.imageInfo.rotationDegrees
         if (rotationDegrees != 0) {
             val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
             val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)

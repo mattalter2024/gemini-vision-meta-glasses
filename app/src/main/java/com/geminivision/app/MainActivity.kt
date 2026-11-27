@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         updatePhoneCameraPermissionFlag()
+        viewModel.onAudioPermissionUpdated(hasAudioPermission())
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -123,7 +124,19 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         updatePhoneCameraPermissionFlag()
-        viewModel.onAppResumed()
+        viewModel.onAppResumed(hasAudioPermission())
+    }
+
+    override fun onPause() {
+        super.onPause()
+        viewModel.onAppPaused()
+    }
+
+    private fun hasAudioPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     override fun onNewIntent(intent: Intent) {

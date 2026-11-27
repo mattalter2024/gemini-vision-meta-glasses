@@ -729,13 +729,21 @@ private fun CameraQaOverlay(
                         .size(44.dp)
                         .clip(CircleShape)
                         .background(
-                            if (state.isVoiceListening) AlertCoral else GeminiBlue.copy(alpha = 0.22f)
+                            when {
+                                state.isVoiceListening -> LiveEmerald
+                                state.isHandsFreeVoiceArmed -> GeminiBlue.copy(alpha = 0.3f)
+                                else -> Color(0xFF1E293B)
+                            }
                         )
                 ) {
                     Icon(
-                        imageVector = if (state.isVoiceListening) Icons.Default.Stop else Icons.Default.Mic,
-                        contentDescription = "Ask with voice",
-                        tint = if (state.isVoiceListening) Color.White else GeminiBlue
+                        imageVector = if (state.isHandsFreeVoiceArmed) Icons.Default.Mic else Icons.Default.MicOff,
+                        contentDescription = if (state.isHandsFreeVoiceArmed) "Pause hands-free voice" else "Enable hands-free voice",
+                        tint = when {
+                            state.isVoiceListening -> Color(0xFF04131A)
+                            state.isHandsFreeVoiceArmed -> GeminiBlue
+                            else -> Color(0xFF94A3B8)
+                        }
                     )
                 }
 
@@ -747,7 +755,12 @@ private fun CameraQaOverlay(
                     modifier = Modifier.weight(1f),
                     placeholder = {
                         Text(
-                            if (state.isVoiceListening) "Listening..." else "Ask Gemini about your view...",
+                            when {
+                                state.isVoiceListening -> "Listening — just speak..."
+                                state.isTtsSpeaking -> "Speaking answer..."
+                                state.isHandsFreeVoiceArmed -> "Voice ready — speak or type..."
+                                else -> "Voice paused — tap mic or type..."
+                            },
                             maxLines = 1
                         )
                     },

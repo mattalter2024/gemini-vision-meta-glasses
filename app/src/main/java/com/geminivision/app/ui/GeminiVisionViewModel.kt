@@ -56,6 +56,7 @@ data class MainUiState(
     val qaMessages: List<QaMessage> = emptyList(),
     val qaDraftPrompt: String = "",
     val isQaLoading: Boolean = false,
+    val isHandsFreeVoiceArmed: Boolean = true,
     val isVoiceListening: Boolean = false,
     val isTtsSpeaking: Boolean = false,
     // Live Mode
@@ -84,11 +85,20 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
     private val phoneFrameJpegRef = AtomicReference<ByteArray?>(null)
     private val phoneFrameBitmapRef = AtomicReference<Bitmap?>(null)
     private var lastQaInteractionId: String? = null
+    @Volatile
+    private var hasAudioPermission: Boolean = false
+    @Volatile
+    private var isAppForeground: Boolean = false
 
     private var liveVideoPumpJob: Job? = null
 
     private val _uiState = MutableStateFlow(
-        MainUiState(settings = settingsRepo.load())
+        settingsRepo.load().let { loaded ->
+            MainUiState(
+                settings = loaded,
+                isHandsFreeVoiceArmed = loaded.autoListenOnStart
+            )
+        }
     )
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
@@ -137,18 +147,28 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
 
     fun selectMode(mode: AppMode) {
         if (_uiState.value.mode == mode) return
-        if (mode == AppMode.CAMERA_QA && _uiState.value.liveConnectionState != LiveConnectionState.DISCONNECTED) {
-            stopLiveSession()
-        }
-        if (mode == AppMode.GEMINI_LIVE) {
+        if (mode == AppMode.CAMERA_QA) {
+            if (_uiState.value.liveConnectionState != LiveConnectionState.DISCONNECTED) {
+                stopLiveSession()
+            }
+            _uiState.update { it.copy(mode = mode, bannerMessage = null) }
+            if (_uiState.value.isHandsFreeVoiceArmed) {
+                armHandsFreeListeningIfReady()
+            }
+        } else {
             voiceAssist.stopListening()
             voiceAssist.stopSpeaking()
+            _uiState.update { it.copy(mode = mode, bannerMessage = null) }
         }
-        _uiState.update { it.copy(mode = mode, bannerMessage = null) }
     }
 
     fun openSettings(show: Boolean) {
         _uiState.update { it.copy(showSettings = show) }
+        if (show) {
+            voiceAssist.stopListening()
+        } else if (_uiState.value.isHandsFreeVoiceArmed && _uiState.value.mode == AppMode.CAMERA_QA) {
+            armHandsFreeListeningIfReady()
+        }
     }
 
     fun dismissBanner() {
@@ -195,8 +215,30 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
         glassesManager.openGlassesAppUpdate(activity)
     }
 
-    fun onAppResumed() {
+    fun onAppResumed(audioPermissionGranted: Boolean) {
+        isAppForeground = true
+        hasAudioPermission = audioPermissionGranted
         glassesManager.onAppResumed()
+        if (_uiState.value.isHandsFreeVoiceArmed &&
+            _uiState.value.mode == AppMode.CAMERA_QA &&
+            !_uiState.value.showSettings
+        ) {
+            armHandsFreeListeningIfReady()
+        }
+    }
+
+    fun onAppPaused() {
+        isAppForeground = false
+        voiceAssist.stopListening()
+    }
+
+    fun onAudioPermissionUpdated(granted: Boolean) {
+        hasAudioPermission = granted
+        if (granted && isAppForeground && _uiState.value.isHandsFreeVoiceArmed &&
+            _uiState.value.mode == AppMode.CAMERA_QA && !_uiState.value.showSettings
+        ) {
+            armHandsFreeListeningIfReady()
+        }
     }
 
     fun startGlassesStream() {
@@ -224,11 +266,23 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun toggleQaVoiceInput() {
-        if (_uiState.value.isVoiceListening) {
+        val nextArmed = !_uiState.value.isHandsFreeVoiceArmed
+        _uiState.update { it.copy(isHandsFreeVoiceArmed = nextArmed) }
+        if (nextArmed) {
+            armHandsFreeListeningIfReady()
+        } else {
             voiceAssist.stopListening()
-            return
         }
+    }
+
+    private fun armHandsFreeListeningIfReady() {
+        val state = _uiState.value
+        if (!hasAudioPermission || !isAppForeground) return
+        if (state.mode != AppMode.CAMERA_QA || state.showSettings || state.isQaLoading || state.isTtsSpeaking) return
+        if (state.isVoiceListening) return
+
         voiceAssist.startListening(
+            continuous = true,
             onPartial = { partial ->
                 _uiState.update { it.copy(qaDraftPrompt = partial) }
             },
@@ -307,7 +361,17 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
                         )
                     }
                     if (_uiState.value.settings.autoSpeakQa) {
-                        voiceAssist.speak(interaction.text)
+                        voiceAssist.speak(interaction.text) {
+                            if (_uiState.value.isHandsFreeVoiceArmed) {
+                                viewModelScope.launch {
+                                    delay(350L)
+                                    armHandsFreeListeningIfReady()
+                                }
+                            }
+                        }
+                    } else if (_uiState.value.isHandsFreeVoiceArmed) {
+                        delay(350L)
+                        armHandsFreeListeningIfReady()
                     }
                 },
                 onFailure = { err ->
@@ -321,6 +385,10 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
                                 isError = true
                             )
                         )
+                    }
+                    if (_uiState.value.isHandsFreeVoiceArmed) {
+                        delay(600L)
+                        armHandsFreeListeningIfReady()
                     }
                 }
             )

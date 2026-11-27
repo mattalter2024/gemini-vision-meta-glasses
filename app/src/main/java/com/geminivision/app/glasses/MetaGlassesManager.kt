@@ -36,6 +36,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -136,9 +137,6 @@ class MetaGlassesManager {
     private var streamStateJob: Job? = null
     private var streamErrorJob: Job? = null
     private var deviceMetaJob: Job? = null
-
-    @Volatile
-    private var lastFrameProcessMs: Long = 0L
 
     init {
         observeWearables()
@@ -244,8 +242,9 @@ class MetaGlassesManager {
             )
         }
 
-        // If user already tapped Start (or just granted permission) and was waiting for glasses to connect, start automatically!
-        if (isEligible && _status.value.isWaitingForEligibleDevice && deviceSession == null) {
+        // Auto-start camera stream whenever glasses become eligible and permission is already granted
+        val s = _status.value
+        if (isEligible && s.isRegistered && s.cameraPermissionGranted && deviceSession == null) {
             createAndStartSession(deviceId)
         }
     }
@@ -289,6 +288,11 @@ class MetaGlassesManager {
             Wearables.checkPermissionStatus(Permission.CAMERA).getOrNull() == PermissionStatus.Granted
         }.getOrDefault(false)
         _status.update { it.copy(cameraPermissionGranted = granted) }
+        if (granted && deviceSession == null) {
+            findBestEligibleDeviceId()?.let { eligibleId ->
+                createAndStartSession(eligibleId)
+            }
+        }
         return granted
     }
 
@@ -494,23 +498,18 @@ class MetaGlassesManager {
 
                 videoCollectJob?.cancel()
                 videoCollectJob = scope.launch(Dispatchers.Default) {
-                    stream.videoStream.collect { frame ->
+                    // conflate() drops stale frames so live preview stays smooth and low-latency (~24 FPS)
+                    stream.videoStream.conflate().collect { frame ->
                         if (frame.isCodecConfig || frame.isCompressed) return@collect
-                        val now = System.currentTimeMillis()
-                        if (now - lastFrameProcessMs < 150L) return@collect
-                        lastFrameProcessMs = now
-
-                        val decoded = FrameCodec.i420BufferToJpegAndBitmap(
+                        val bitmap = FrameCodec.i420BufferToBitmapFast(
                             buffer = frame.buffer,
                             width = frame.width,
                             height = frame.height,
-                            maxEdge = 768,
-                            jpegQuality = 76
+                            maxEdge = 720
                         ) ?: return@collect
 
-                        latestJpegRef.set(decoded.first)
-                        latestBitmapRef.set(decoded.second)
-                        _previewBitmap.value = decoded.second
+                        latestBitmapRef.set(bitmap)
+                        _previewBitmap.value = bitmap
                     }
                 }
 
@@ -528,7 +527,20 @@ class MetaGlassesManager {
         )
     }
 
-    fun getLatestJpegFrame(): ByteArray? = latestJpegRef.get()
+    /**
+     * Encodes the latest preview Bitmap to JPEG on demand (avoids encoding 24 JPEGs/sec during preview).
+     */
+    fun getLatestJpegFrame(): ByteArray? {
+        val bmp = latestBitmapRef.get()
+        if (bmp != null && !bmp.isRecycled) {
+            val jpeg = runCatching { FrameCodec.bitmapToJpeg(bmp, maxEdge = 768, jpegQuality = 75) }.getOrNull()
+            if (jpeg != null) {
+                latestJpegRef.set(jpeg)
+                return jpeg
+            }
+        }
+        return latestJpegRef.get()
+    }
 
     fun getLatestBitmap(): Bitmap? = latestBitmapRef.get()
 
@@ -558,8 +570,9 @@ class MetaGlassesManager {
                 null -> Unit
             }
         }
-        val fallbackJpeg = latestJpegRef.get() ?: return@withContext null
-        fallbackJpeg to latestBitmapRef.get()
+        val bmp = latestBitmapRef.get()
+        val fallbackJpeg = getLatestJpegFrame() ?: return@withContext null
+        fallbackJpeg to bmp
     }
 
     fun stopCameraStream() {
