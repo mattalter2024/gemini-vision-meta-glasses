@@ -59,6 +59,7 @@ fun SettingsBottomSheet(
     var liveVoice by remember(settings) { mutableStateOf(settings.liveVoice) }
     var systemPrompt by remember(settings) { mutableStateOf(settings.systemPrompt) }
     var autoListenOnStart by remember(settings) { mutableStateOf(settings.autoListenOnStart) }
+    var keepRunningWhenLocked by remember(settings) { mutableStateOf(settings.keepRunningWhenLocked) }
     var autoSpeakQa by remember(settings) { mutableStateOf(settings.autoSpeakQa) }
     var preferGlassesAudio by remember(settings) { mutableStateOf(settings.preferGlassesAudio) }
     var videoSource by remember(settings) { mutableStateOf(settings.videoSource) }
@@ -158,6 +159,22 @@ fun SettingsBottomSheet(
                     )
                 }
                 Switch(checked = autoListenOnStart, onCheckedChange = { autoListenOnStart = it })
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Run while phone is locked", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Keeps glasses camera, hands-free voice, and Gemini Live active in your pocket",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = keepRunningWhenLocked, onCheckedChange = { keepRunningWhenLocked = it })
             }
 
             Row(
@@ -270,6 +287,7 @@ fun SettingsBottomSheet(
                             liveVoice = liveVoice.trim(),
                             systemPrompt = systemPrompt.trim(),
                             autoListenOnStart = autoListenOnStart,
+                            keepRunningWhenLocked = keepRunningWhenLocked,
                             autoSpeakQa = autoSpeakQa,
                             preferGlassesAudio = preferGlassesAudio,
                             videoSource = videoSource

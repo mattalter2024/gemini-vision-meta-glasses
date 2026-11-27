@@ -15,6 +15,7 @@ data class AppSettings(
     val liveVoice: String = DEFAULT_LIVE_VOICE,
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
     val autoListenOnStart: Boolean = true, // Ready to listen by voice immediately when app opens
+    val keepRunningWhenLocked: Boolean = true, // Foreground service keeps voice & glasses alive while locked
     val autoSpeakQa: Boolean = true,       // Default ON for display-less Meta glasses
     val preferGlassesAudio: Boolean = true,
     val videoSource: VideoSourceMode = VideoSourceMode.META_GLASSES
@@ -66,6 +67,7 @@ class SettingsRepository(context: Context) {
             systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, AppSettings.DEFAULT_SYSTEM_PROMPT)
                 ?.trim().orEmpty().ifEmpty { AppSettings.DEFAULT_SYSTEM_PROMPT },
             autoListenOnStart = prefs.getBoolean(KEY_AUTO_LISTEN_ON_START, true),
+            keepRunningWhenLocked = prefs.getBoolean(KEY_KEEP_RUNNING_WHEN_LOCKED, true),
             autoSpeakQa = prefs.getBoolean(KEY_AUTO_SPEAK_QA, true),
             preferGlassesAudio = prefs.getBoolean(KEY_PREFER_GLASSES_AUDIO, true),
             videoSource = videoSource
@@ -80,6 +82,7 @@ class SettingsRepository(context: Context) {
             .putString(KEY_LIVE_VOICE, settings.liveVoice.trim().ifEmpty { AppSettings.DEFAULT_LIVE_VOICE })
             .putString(KEY_SYSTEM_PROMPT, settings.systemPrompt.trim().ifEmpty { AppSettings.DEFAULT_SYSTEM_PROMPT })
             .putBoolean(KEY_AUTO_LISTEN_ON_START, settings.autoListenOnStart)
+            .putBoolean(KEY_KEEP_RUNNING_WHEN_LOCKED, settings.keepRunningWhenLocked)
             .putBoolean(KEY_AUTO_SPEAK_QA, settings.autoSpeakQa)
             .putBoolean(KEY_PREFER_GLASSES_AUDIO, settings.preferGlassesAudio)
             .putString(KEY_VIDEO_SOURCE, settings.videoSource.name)
@@ -94,6 +97,7 @@ class SettingsRepository(context: Context) {
         const val KEY_LIVE_VOICE = "live_voice"
         const val KEY_SYSTEM_PROMPT = "system_prompt"
         const val KEY_AUTO_LISTEN_ON_START = "auto_listen_on_start"
+        const val KEY_KEEP_RUNNING_WHEN_LOCKED = "keep_running_when_locked"
         const val KEY_AUTO_SPEAK_QA = "auto_speak_qa"
         const val KEY_PREFER_GLASSES_AUDIO = "prefer_glasses_audio"
         const val KEY_VIDEO_SOURCE = "video_source"

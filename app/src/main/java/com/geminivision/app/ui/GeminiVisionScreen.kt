@@ -608,6 +608,17 @@ private fun StatusPillsRow(
             }
         }
 
+        if (state.isBackgroundServiceActive) {
+            Surface(shape = CircleShape, color = Color(0xB80F172A)) {
+                Text(
+                    text = "Lock-Screen On",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = LiveEmerald,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
+        }
+
         if (state.mode == AppMode.GEMINI_LIVE || state.isGlassesAudioActive) {
             Surface(shape = CircleShape, color = Color(0xB80F172A)) {
                 Row(

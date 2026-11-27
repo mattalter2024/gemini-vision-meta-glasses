@@ -16,6 +16,7 @@ import com.geminivision.app.gemini.LiveConnectionState
 import com.geminivision.app.gemini.LiveServerEvent
 import com.geminivision.app.glasses.GlassesUiStatus
 import com.geminivision.app.glasses.MetaGlassesManager
+import com.geminivision.app.service.GlassesBackgroundService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -70,6 +71,7 @@ data class MainUiState(
     val liveTranscript: List<LiveTranscriptLine> = emptyList(),
     val liveNudgeDraft: String = "",
     // General
+    val isBackgroundServiceActive: Boolean = false,
     val bannerMessage: String? = null,
     val showSettings: Boolean = false
 )
@@ -143,6 +145,21 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
                 _uiState.update { it.copy(isTtsSpeaking = speaking) }
             }
         }
+        viewModelScope.launch {
+            GlassesBackgroundService.isRunning.collect { running ->
+                _uiState.update { it.copy(isBackgroundServiceActive = running) }
+            }
+        }
+        viewModelScope.launch {
+            GlassesBackgroundService.stopRequested.collect {
+                // User tapped "Stop" on the lock-screen notification
+                voiceAssist.stopListening()
+                voiceAssist.stopSpeaking()
+                stopLiveSession()
+                glassesManager.stopCameraStream()
+                _uiState.update { it.copy(isHandsFreeVoiceArmed = false) }
+            }
+        }
     }
 
     fun selectMode(mode: AppMode) {
@@ -179,6 +196,7 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
         settingsRepo.save(newSettings)
         val previousSource = _uiState.value.settings.videoSource
         _uiState.update { it.copy(settings = newSettings) }
+        syncBackgroundServiceState()
         if (previousSource != newSettings.videoSource) {
             if (newSettings.videoSource == VideoSourceMode.PHONE_CAMERA) {
                 glassesManager.stopCameraStream()
@@ -231,6 +249,7 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
         isAppForeground = true
         hasAudioPermission = audioPermissionGranted
         glassesManager.onAppResumed()
+        syncBackgroundServiceState()
         if (_uiState.value.isHandsFreeVoiceArmed &&
             _uiState.value.mode == AppMode.CAMERA_QA &&
             !_uiState.value.showSettings
@@ -241,15 +260,45 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
 
     fun onAppPaused() {
         isAppForeground = false
-        voiceAssist.stopListening()
+        // Only stop voice listening when locked/backgrounded if user disabled lock-screen mode
+        val keepAlive = _uiState.value.settings.keepRunningWhenLocked &&
+            GlassesBackgroundService.isRunning.value
+        if (!keepAlive) {
+            voiceAssist.stopListening()
+        }
     }
 
     fun onAudioPermissionUpdated(granted: Boolean) {
         hasAudioPermission = granted
+        syncBackgroundServiceState()
         if (granted && isAppForeground && _uiState.value.isHandsFreeVoiceArmed &&
             _uiState.value.mode == AppMode.CAMERA_QA && !_uiState.value.showSettings
         ) {
             armHandsFreeListeningIfReady()
+        }
+    }
+
+    private fun syncBackgroundServiceState() {
+        val state = _uiState.value
+        val app = getApplication<Application>()
+        val shouldRun = state.settings.keepRunningWhenLocked &&
+            hasAudioPermission &&
+            (state.isHandsFreeVoiceArmed ||
+                state.liveConnectionState != LiveConnectionState.DISCONNECTED ||
+                state.glassesStatus.isStreaming)
+
+        if (shouldRun && isAppForeground) {
+            val statusText = when {
+                state.liveConnectionState == LiveConnectionState.CONNECTED ->
+                    "Gemini Live call active • Meta glasses hands-free"
+                state.isHandsFreeVoiceArmed ->
+                    "Listening hands-free • Meta glasses ready while locked"
+                else ->
+                    "Meta glasses camera active in background"
+            }
+            GlassesBackgroundService.startOrUpdate(app, statusText)
+        } else if (!state.settings.keepRunningWhenLocked) {
+            GlassesBackgroundService.stop(app)
         }
     }
 
@@ -289,7 +338,8 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
 
     private fun armHandsFreeListeningIfReady() {
         val state = _uiState.value
-        if (!hasAudioPermission || !isAppForeground) return
+        val allowWhenLocked = state.settings.keepRunningWhenLocked && GlassesBackgroundService.isRunning.value
+        if (!hasAudioPermission || (!isAppForeground && !allowWhenLocked)) return
         if (state.mode != AppMode.CAMERA_QA || state.showSettings || state.isQaLoading || state.isTtsSpeaking) return
         if (state.isVoiceListening) return
 
@@ -458,8 +508,10 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
                     _uiState.update { it.copy(liveConnectionState = state) }
                     if (state == LiveConnectionState.CONNECTED) {
                         startLiveAudioAndVideoLoops()
+                        syncBackgroundServiceState()
                     } else if (state == LiveConnectionState.DISCONNECTED) {
                         stopLiveAudioAndVideoLoops()
+                        syncBackgroundServiceState()
                     }
                 }
 
@@ -593,6 +645,7 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
 
     override fun onCleared() {
         super.onCleared()
+        GlassesBackgroundService.stop(getApplication())
         stopLiveSession()
         voiceAssist.release()
         glassesManager.release()
