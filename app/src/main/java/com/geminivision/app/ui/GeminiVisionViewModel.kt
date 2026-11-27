@@ -80,7 +80,7 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
     private val liveClient = GeminiLiveClient()
     private val audioEngine = LiveAudioEngine(application)
     private val voiceAssist = VoiceAssistHelper(application)
-    val glassesManager = MetaGlassesManager()
+    val glassesManager = MetaGlassesManager(application)
 
     private val phoneFrameJpegRef = AtomicReference<ByteArray?>(null)
     private val phoneFrameBitmapRef = AtomicReference<Bitmap?>(null)
@@ -213,6 +213,18 @@ class GeminiVisionViewModel(application: Application) : AndroidViewModel(applica
 
     fun openGlassesAppUpdate(activity: Activity) {
         glassesManager.openGlassesAppUpdate(activity)
+    }
+
+    fun reconnectDatBridge() {
+        glassesManager.reinitializeDatBridge(autoStartWhenConnected = true)
+    }
+
+    fun openMetaAiApp(activity: Activity) {
+        glassesManager.openMetaAiApp(activity)
+    }
+
+    fun onBluetoothPermissionGranted() {
+        glassesManager.onBluetoothPermissionGranted()
     }
 
     fun onAppResumed(audioPermissionGranted: Boolean) {

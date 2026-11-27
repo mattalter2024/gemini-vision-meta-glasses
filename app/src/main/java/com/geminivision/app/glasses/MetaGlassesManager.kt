@@ -1,9 +1,15 @@
 package com.geminivision.app.glasses
 
+import android.Manifest
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.geminivision.app.camera.FrameCodec
 import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.addCamera
@@ -32,6 +38,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -46,6 +53,7 @@ data class GlassesUiStatus(
     val registrationState: RegistrationState = RegistrationState.UNAVAILABLE,
     val sessionState: DeviceSessionState = DeviceSessionState.IDLE,
     val streamState: StreamState = StreamState.STOPPED,
+    val bluetoothPermissionGranted: Boolean = true,
     val discoveredDeviceCount: Int = 0,
     val deviceName: String? = null,
     val deviceType: DeviceType? = null,
@@ -56,6 +64,7 @@ data class GlassesUiStatus(
     val donState: DonState? = null,
     val cameraPermissionGranted: Boolean = false,
     val isWaitingForEligibleDevice: Boolean = false,
+    val isReconnectingBridge: Boolean = false,
     val requiresFirmwareUpdate: Boolean = false,
     val requiresGlassesAppUpdate: Boolean = false,
     val lastError: String? = null
@@ -73,7 +82,8 @@ data class GlassesUiStatus(
 
     val diagnosticsLine: String
         get() = buildString {
-            append("Reg: ${registrationState.name}")
+            append("BT: ${if (bluetoothPermissionGranted) "OK" else "DENIED"}")
+            append(" • Reg: ${registrationState.name}")
             append(" • Devices: $discoveredDeviceCount")
             linkState?.let { append(" • Link: ${it.name}") }
             compatibility?.let { append(" • Compat: ${it.name}") }
@@ -86,6 +96,7 @@ data class GlassesUiStatus(
                 append(deviceName ?: "Meta Glasses")
                 batteryLevel?.takeIf { it in 0..100 }?.let { append(" • $it%") }
             }
+            isReconnectingBridge -> "Reconnecting DAT bridge..."
             isWaitingForEligibleDevice -> "Waiting for glasses link..."
             sessionState == DeviceSessionState.STARTING || streamState == StreamState.STARTING ->
                 "Connecting glasses camera..."
@@ -108,16 +119,18 @@ data class GlassesUiStatus(
 /**
  * Manages the Meta Wearables Device Access Toolkit (DAT) lifecycle for
  * display-less Meta smart glasses (Ray-Ban Meta / Oakley Meta):
- * - Registration with Meta AI companion app
- * - Glasses camera permission checks
- * - Live eligibility monitoring (auto-waits until linkState == CONNECTED & compatibility == COMPATIBLE)
- * - DeviceSession & Camera Stream lifecycle (POV video frames -> JPEG + Bitmap)
- * - Still photo capture for high-detail Vision QA
+ * - Re-initializes the DAT ACDC bridge cleanly whenever BLUETOOTH_CONNECT is newly granted
+ *   or when the bridge gets stuck in LinkState.DISCONNECTED.
+ * - Monitors live device eligibility (auto-starts once linkState == CONNECTED & compatibility == COMPATIBLE).
+ * - Streams low-latency POV video frames via conflate() + direct I420->Bitmap decoding.
  */
-class MetaGlassesManager {
+class MetaGlassesManager(context: Context) {
+    private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val _status = MutableStateFlow(GlassesUiStatus())
+    private val _status = MutableStateFlow(
+        GlassesUiStatus(bluetoothPermissionGranted = hasBluetoothPermission())
+    )
     val status: StateFlow<GlassesUiStatus> = _status.asStateFlow()
 
     private val _previewBitmap = MutableStateFlow<Bitmap?>(null)
@@ -131,7 +144,10 @@ class MetaGlassesManager {
     private var deviceSession: DeviceSession? = null
     @Volatile
     private var camera: Camera? = null
+    @Volatile
+    private var lastBridgeResetMs: Long = 0L
 
+    private var observerRootJob: Job? = null
     private var sessionWatcherJob: Job? = null
     private var videoCollectJob: Job? = null
     private var streamStateJob: Job? = null
@@ -142,67 +158,174 @@ class MetaGlassesManager {
         observeWearables()
     }
 
-    private fun observeWearables() {
-        scope.launch {
-            runCatching {
-                Wearables.registrationState.collectLatest { regState ->
-                    _status.update { it.copy(registrationState = regState) }
-                    if (regState == RegistrationState.REGISTERED) {
-                        refreshCameraPermission()
-                    }
-                }
-            }.onFailure { err ->
-                Log.w(TAG, "Unable to observe Wearables.registrationState", err)
-            }
+    private fun hasBluetoothPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
         }
+    }
 
-        scope.launch {
-            runCatching {
-                Wearables.devices.collectLatest { deviceIds ->
-                    deviceMetaJob?.cancel()
-                    _status.update { it.copy(discoveredDeviceCount = deviceIds.size) }
+    private fun observeWearables() {
+        observerRootJob?.cancel()
+        deviceMetaJob?.cancel()
 
-                    if (deviceIds.isEmpty()) {
-                        activeEligibleDeviceIdRef.set(null)
+        observerRootJob = scope.launch {
+            launch {
+                runCatching {
+                    Wearables.registrationState.collectLatest { regState ->
                         _status.update {
                             it.copy(
-                                deviceName = null,
-                                deviceType = null,
-                                batteryLevel = null,
-                                linkState = null,
-                                compatibility = null,
-                                hingeState = null,
-                                donState = null,
-                                requiresFirmwareUpdate = false
+                                registrationState = regState,
+                                bluetoothPermissionGranted = hasBluetoothPermission()
                             )
                         }
-                        return@collectLatest
+                        if (regState == RegistrationState.REGISTERED) {
+                            refreshCameraPermission()
+                        }
                     }
+                }.onFailure { err ->
+                    Log.w(TAG, "Unable to observe Wearables.registrationState", err)
+                }
+            }
 
-                    // Observe metadata for all discovered devices and prefer the first CONNECTED + COMPATIBLE one
-                    deviceMetaJob = scope.launch {
-                        val metadataMap = Wearables.devicesMetadata
-                        for (deviceId in deviceIds) {
-                            val metaFlow = metadataMap[deviceId] ?: continue
-                            launch {
-                                metaFlow.collectLatest { device ->
-                                    onDeviceMetadataUpdated(deviceId, device)
+            launch {
+                runCatching {
+                    Wearables.devices.collectLatest { deviceIds ->
+                        deviceMetaJob?.cancel()
+                        _status.update { it.copy(discoveredDeviceCount = deviceIds.size) }
+
+                        if (deviceIds.isEmpty()) {
+                            activeEligibleDeviceIdRef.set(null)
+                            _status.update {
+                                it.copy(
+                                    deviceName = null,
+                                    deviceType = null,
+                                    batteryLevel = null,
+                                    linkState = null,
+                                    compatibility = null,
+                                    hingeState = null,
+                                    donState = null,
+                                    requiresFirmwareUpdate = false
+                                )
+                            }
+                            return@collectLatest
+                        }
+
+                        deviceMetaJob = scope.launch {
+                            val metadataMap = Wearables.devicesMetadata
+                            for (deviceId in deviceIds) {
+                                val metaFlow = metadataMap[deviceId] ?: continue
+                                launch {
+                                    metaFlow.collectLatest { device ->
+                                        onDeviceMetadataUpdated(deviceId, device)
+                                    }
                                 }
                             }
                         }
                     }
+                }.onFailure { err ->
+                    Log.w(TAG, "Unable to observe Wearables.devices", err)
                 }
-            }.onFailure { err ->
-                Log.w(TAG, "Unable to observe Wearables.devices", err)
             }
+
+            launch {
+                runCatching {
+                    Wearables.registrationErrorStream.collect { error ->
+                        _status.update { it.copy(lastError = "Meta registration error: ${error.description}") }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Resets and re-initializes the Meta Wearables DAT SDK / ACDC Bluetooth bridge.
+     * Crucial when BLUETOOTH_CONNECT is granted after Application.onCreate(), or when
+     * ACDC gets stuck in LinkState.DISCONNECTED after glasses sleep / Meta AI idle.
+     */
+    fun reinitializeDatBridge(autoStartWhenConnected: Boolean = true) {
+        val now = System.currentTimeMillis()
+        if (now - lastBridgeResetMs < 2500L) return
+        lastBridgeResetMs = now
+
+        val btGranted = hasBluetoothPermission()
+        _status.update {
+            it.copy(
+                bluetoothPermissionGranted = btGranted,
+                isReconnectingBridge = true,
+                isWaitingForEligibleDevice = autoStartWhenConnected,
+                lastError = if (!btGranted) {
+                    "Android 'Nearby devices' (Bluetooth) permission is denied. Grant it to connect to your Meta glasses."
+                } else {
+                    null
+                }
+            )
+        }
+        if (!btGranted) {
+            _status.update { it.copy(isReconnectingBridge = false) }
+            return
         }
 
         scope.launch {
-            runCatching {
-                Wearables.registrationErrorStream.collect { error ->
-                    _status.update { it.copy(lastError = "Meta registration error: ${error.description}") }
+            stopCameraStreamInternal(clearWaiting = false)
+            observerRootJob?.cancel()
+            deviceMetaJob?.cancel()
+            activeEligibleDeviceIdRef.set(null)
+
+            runCatching { Wearables.reset() }
+                .onFailure { Log.w(TAG, "Wearables.reset() warning", it) }
+
+            delay(250L)
+
+            val initResult = runCatching { Wearables.initialize(appContext) }
+            initResult.onFailure { err ->
+                _status.update {
+                    it.copy(
+                        isReconnectingBridge = false,
+                        lastError = "Failed to re-initialize DAT bridge: ${err.message}"
+                    )
                 }
+                return@launch
             }
+
+            // Re-subscribe to the brand new StateFlows created by Wearables.initialize()
+            observeWearables()
+            delay(500L)
+            _status.update { it.copy(isReconnectingBridge = false) }
+
+            val eligibleId = findBestEligibleDeviceId()
+            if (eligibleId != null && autoStartWhenConnected && deviceSession == null) {
+                createAndStartSession(eligibleId)
+            }
+        }
+    }
+
+    fun onBluetoothPermissionGranted() {
+        val wasGranted = _status.value.bluetoothPermissionGranted
+        val nowGranted = hasBluetoothPermission()
+        _status.update { it.copy(bluetoothPermissionGranted = nowGranted) }
+        // If BT permission just transitioned from denied -> granted (first launch!), restart DAT bridge so ACDC can open BT leases!
+        if (nowGranted && !wasGranted) {
+            reinitializeDatBridge(autoStartWhenConnected = true)
+        }
+    }
+
+    fun openMetaAiApp(activity: Activity) {
+        val pm = activity.packageManager
+        val launchIntent: Intent? = pm.getLaunchIntentForPackage("com.facebook.stella")
+            ?: pm.getLaunchIntentForPackage("com.facebook.stella_debug")
+        if (launchIntent != null) {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            runCatching { activity.startActivity(launchIntent) }
+                .onFailure { err ->
+                    _status.update { it.copy(lastError = "Unable to open Meta AI app: ${err.message}") }
+                }
+        } else {
+            _status.update { it.copy(lastError = "Meta AI app is not installed on this phone.") }
         }
     }
 
@@ -217,7 +340,6 @@ class MetaGlassesManager {
         }
 
         val currentEligible = activeEligibleDeviceIdRef.get()
-        // If another device is already eligible, don't overwrite the primary UI status with a disconnected one
         if (currentEligible != null && currentEligible != deviceId) return
 
         val needsFirmware = device.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED
@@ -242,7 +364,6 @@ class MetaGlassesManager {
             )
         }
 
-        // Auto-start camera stream whenever glasses become eligible and permission is already granted
         val s = _status.value
         if (isEligible && s.isRegistered && s.cameraPermissionGranted && deviceSession == null) {
             createAndStartSession(deviceId)
@@ -309,12 +430,18 @@ class MetaGlassesManager {
     }
 
     fun onAppResumed() {
+        val btGranted = hasBluetoothPermission()
+        _status.update { it.copy(bluetoothPermissionGranted = btGranted) }
         scope.launch {
-            if (_status.value.isRegistered) {
+            val s = _status.value
+            if (s.isRegistered) {
                 refreshCameraPermission()
                 val eligibleId = findBestEligibleDeviceId()
-                if (eligibleId != null && _status.value.isWaitingForEligibleDevice && deviceSession == null) {
+                if (eligibleId != null && deviceSession == null && _status.value.cameraPermissionGranted) {
                     createAndStartSession(eligibleId)
+                } else if (btGranted && s.linkState == LinkState.DISCONNECTED && deviceSession == null) {
+                    // Coming back from Meta AI app while still marked DISCONNECTED -> reset ACDC bridge to re-acquire link lease!
+                    reinitializeDatBridge(autoStartWhenConnected = true)
                 }
             }
         }
@@ -322,9 +449,18 @@ class MetaGlassesManager {
 
     fun startCameraStream() {
         if (deviceSession != null && _status.value.isStreaming) return
-        stopCameraStream()
+        stopCameraStreamInternal(clearWaiting = false)
 
         val snapshot = _status.value
+        if (!hasBluetoothPermission()) {
+            _status.update {
+                it.copy(
+                    bluetoothPermissionGranted = false,
+                    lastError = "Bluetooth ('Nearby devices') permission is required for Meta glasses."
+                )
+            }
+            return
+        }
         if (!snapshot.isRegistered) {
             _status.update {
                 it.copy(lastError = "Connect your glasses in the Meta AI app first (Registration: ${snapshot.registrationState}).")
@@ -334,12 +470,17 @@ class MetaGlassesManager {
 
         val eligibleId = findBestEligibleDeviceId()
         if (eligibleId == null) {
-            val helpfulReason = buildNoEligibleDeviceReason(_status.value)
-            _status.update {
-                it.copy(
-                    isWaitingForEligibleDevice = true,
-                    lastError = helpfulReason
-                )
+            // If DAT bridge is stuck DISCONNECTED or 0 devices, actively reset & re-init ACDC so it requests a fresh Bluetooth lease!
+            if (snapshot.linkState == LinkState.DISCONNECTED || snapshot.discoveredDeviceCount == 0) {
+                reinitializeDatBridge(autoStartWhenConnected = true)
+                _status.update { it.copy(lastError = buildNoEligibleDeviceReason(it)) }
+            } else {
+                _status.update {
+                    it.copy(
+                        isWaitingForEligibleDevice = true,
+                        lastError = buildNoEligibleDeviceReason(it)
+                    )
+                }
             }
             return
         }
@@ -367,20 +508,22 @@ class MetaGlassesManager {
 
     private fun buildNoEligibleDeviceReason(s: GlassesUiStatus): String {
         return when {
+            !s.bluetoothPermissionGranted ->
+                "Bluetooth ('Nearby devices') permission is denied. Allow it in Android App Settings, then tap Reconnect Bridge."
             s.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED ->
-                "Glasses firmware update required. Tap 'Update Firmware' to update in the Meta AI app."
+                "Glasses firmware update required. Tap 'Update Glasses Firmware' to update in the Meta AI app."
             s.compatibility == DeviceCompatibility.SDK_UPDATE_REQUIRED ->
                 "SDK update required for your glasses firmware."
             s.hingeState == HingeState.CLOSED ->
-                "Glasses hinges are closed. Unfold and wear your Meta glasses, then wait a moment — streaming will start automatically."
+                "Glasses hinges are closed. Unfold and wear your Meta glasses — streaming will start automatically."
             s.discoveredDeviceCount == 0 ->
-                "No eligible Meta glasses found yet. Check that: (1) Developer Mode is ON in Meta AI (Settings → App Info → tap version 5×), (2) your glasses are unfolded & connected in Meta AI, and (3) Bluetooth permission is allowed. Waiting automatically..."
+                "No glasses seen by DAT bridge yet. Open Meta AI, verify glasses show Connected & Developer Mode is ON, then return here."
             s.linkState == LinkState.CONNECTING ->
                 "Meta glasses are connecting... Camera stream will start automatically once connected."
             s.linkState == LinkState.DISCONNECTED ->
-                "Meta glasses (${s.deviceName ?: "paired"}) are currently DISCONNECTED from the DAT bridge. Open the Meta AI app, wake/unfold your glasses, and return here — streaming will auto-start."
+                "Meta glasses (${s.deviceName ?: "paired"}) are DISCONNECTED from the DAT bridge. Tap 'Open Meta AI' to wake the glasses connection (ensure hinges are open & battery optimization isn't killing Meta AI), then return here."
             else ->
-                "Waiting for Meta glasses to become eligible (${s.diagnosticsLine}). Make sure glasses are unfolded, awake, and updated in Meta AI."
+                "Waiting for Meta glasses to become eligible (${s.diagnosticsLine})."
         }
     }
 
@@ -498,7 +641,6 @@ class MetaGlassesManager {
 
                 videoCollectJob?.cancel()
                 videoCollectJob = scope.launch(Dispatchers.Default) {
-                    // conflate() drops stale frames so live preview stays smooth and low-latency (~24 FPS)
                     stream.videoStream.conflate().collect { frame ->
                         if (frame.isCodecConfig || frame.isCompressed) return@collect
                         val bitmap = FrameCodec.i420BufferToBitmapFast(
@@ -527,9 +669,6 @@ class MetaGlassesManager {
         )
     }
 
-    /**
-     * Encodes the latest preview Bitmap to JPEG on demand (avoids encoding 24 JPEGs/sec during preview).
-     */
     fun getLatestJpegFrame(): ByteArray? {
         val bmp = latestBitmapRef.get()
         if (bmp != null && !bmp.isRecycled) {
@@ -576,6 +715,10 @@ class MetaGlassesManager {
     }
 
     fun stopCameraStream() {
+        stopCameraStreamInternal(clearWaiting = true)
+    }
+
+    private fun stopCameraStreamInternal(clearWaiting: Boolean) {
         videoCollectJob?.cancel()
         videoCollectJob = null
         streamStateJob?.cancel()
@@ -597,13 +740,14 @@ class MetaGlassesManager {
             it.copy(
                 sessionState = DeviceSessionState.STOPPED,
                 streamState = StreamState.STOPPED,
-                isWaitingForEligibleDevice = false
+                isWaitingForEligibleDevice = if (clearWaiting) false else it.isWaitingForEligibleDevice
             )
         }
     }
 
     fun release() {
         stopCameraStream()
+        observerRootJob?.cancel()
         deviceMetaJob?.cancel()
         scope.cancel()
     }

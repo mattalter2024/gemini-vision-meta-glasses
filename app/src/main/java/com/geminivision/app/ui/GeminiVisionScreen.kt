@@ -106,6 +106,8 @@ fun GeminiVisionScreen(
     onStopGlassesStream: () -> Unit,
     onOpenFirmwareUpdate: () -> Unit = {},
     onOpenGlassesAppUpdate: () -> Unit = {},
+    onReconnectDatBridge: () -> Unit = {},
+    onOpenMetaAiApp: () -> Unit = {},
     onSwitchToPhoneFallback: () -> Unit,
     onRequestPhoneCameraPermission: () -> Unit,
     onTogglePhoneCameraFacing: () -> Unit,
@@ -137,6 +139,8 @@ fun GeminiVisionScreen(
             onStartGlassesStream = onStartGlassesStream,
             onOpenFirmwareUpdate = onOpenFirmwareUpdate,
             onOpenGlassesAppUpdate = onOpenGlassesAppUpdate,
+            onReconnectDatBridge = onReconnectDatBridge,
+            onOpenMetaAiApp = onOpenMetaAiApp,
             onSwitchToPhoneFallback = onSwitchToPhoneFallback,
             onRequestPhoneCameraPermission = onRequestPhoneCameraPermission,
             onPhoneFrame = onPhoneFrame
@@ -233,6 +237,8 @@ private fun ViewfinderLayer(
     onStartGlassesStream: () -> Unit,
     onOpenFirmwareUpdate: () -> Unit,
     onOpenGlassesAppUpdate: () -> Unit,
+    onReconnectDatBridge: () -> Unit,
+    onOpenMetaAiApp: () -> Unit,
     onSwitchToPhoneFallback: () -> Unit,
     onRequestPhoneCameraPermission: () -> Unit,
     onPhoneFrame: (ByteArray, Bitmap) -> Unit
@@ -255,6 +261,8 @@ private fun ViewfinderLayer(
                     onStartGlassesStream = onStartGlassesStream,
                     onOpenFirmwareUpdate = onOpenFirmwareUpdate,
                     onOpenGlassesAppUpdate = onOpenGlassesAppUpdate,
+                    onReconnectDatBridge = onReconnectDatBridge,
+                    onOpenMetaAiApp = onOpenMetaAiApp,
                     onSwitchToPhoneFallback = onSwitchToPhoneFallback
                 )
             }
@@ -304,6 +312,8 @@ private fun MetaGlassesSetupCanvas(
     onStartGlassesStream: () -> Unit,
     onOpenFirmwareUpdate: () -> Unit,
     onOpenGlassesAppUpdate: () -> Unit,
+    onReconnectDatBridge: () -> Unit,
+    onOpenMetaAiApp: () -> Unit,
     onSwitchToPhoneFallback: () -> Unit
 ) {
     Box(
@@ -413,20 +423,40 @@ private fun MetaGlassesSetupCanvas(
                                 onClick = onStartGlassesStream,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                if (status.isWaitingForEligibleDevice) {
+                                if (status.isWaitingForEligibleDevice || status.isReconnectingBridge) {
                                     CircularProgressIndicator(
                                         modifier = Modifier.size(16.dp),
                                         strokeWidth = 2.dp,
                                         color = MaterialTheme.colorScheme.onPrimary
                                     )
                                     Spacer(Modifier.width(8.dp))
-                                    Text("Retry Glasses Camera")
+                                    Text(if (status.isReconnectingBridge) "Reconnecting Bridge..." else "Retry Glasses Camera")
                                 } else {
                                     Icon(Icons.Default.PlayArrow, contentDescription = null)
                                     Spacer(Modifier.width(6.dp))
                                     Text("Start Glasses Camera")
                                 }
                             }
+                        }
+                    }
+                }
+
+                if (status.isRegistered && !status.isEligibleDeviceReady) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = onReconnectDatBridge,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Reset Bridge")
+                        }
+                        OutlinedButton(
+                            onClick = onOpenMetaAiApp,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Open Meta AI")
                         }
                     }
                 }

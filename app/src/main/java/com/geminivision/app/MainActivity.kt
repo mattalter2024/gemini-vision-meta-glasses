@@ -50,6 +50,7 @@ class MainActivity : ComponentActivity() {
     ) {
         updatePhoneCameraPermissionFlag()
         viewModel.onAudioPermissionUpdated(hasAudioPermission())
+        viewModel.onBluetoothPermissionGranted()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -77,6 +78,8 @@ class MainActivity : ComponentActivity() {
                     onStopGlassesStream = viewModel::stopGlassesStream,
                     onOpenFirmwareUpdate = { viewModel.openGlassesFirmwareUpdate(this) },
                     onOpenGlassesAppUpdate = { viewModel.openGlassesAppUpdate(this) },
+                    onReconnectDatBridge = viewModel::reconnectDatBridge,
+                    onOpenMetaAiApp = { viewModel.openMetaAiApp(this) },
                     onSwitchToPhoneFallback = {
                         viewModel.saveSettings(
                             state.settings.copy(videoSource = VideoSourceMode.PHONE_CAMERA)
